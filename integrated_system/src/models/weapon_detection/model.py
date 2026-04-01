@@ -19,13 +19,12 @@ from src.speech.client import SpeechClient
 class WeaponDetectionModel:
     cfg: WeaponDetectionConfig
     speech: SpeechClient
-    window_name: str = "Weapon Detection (Pi Optimized)"
+    window_name: str = "Weapon Detection (Pi Ultra Optimized)"
 
     _vision_ready: bool = field(default=False, repr=False)
     _yolo: Any = field(default=None, repr=False)
 
-    _frame_counter: int = field(default=0, repr=False)   # ✅ NEW
-
+    _process_this_frame: bool = field(default=True, repr=False)   # ✅ like face model
     _current_detections: list = field(default_factory=list, repr=False)
 
     _weapon_frame_count: int = field(default=0, repr=False)
@@ -37,27 +36,33 @@ class WeaponDetectionModel:
         if self._vision_ready:
             return
 
-        model_path = self.cfg.model_path
-        if not model_path or not model_path.endswith(".pt"):
-            model_path = "yolov8n.pt"
+        model_path = self.cfg.model_path or "yolov8n.pt"
 
+        # ✅ LOAD LIGHT MODEL + CPU OPT
         self._yolo = YOLO(model_path)
+        self._yolo.fuse()   # 🔥 faster inference
+
         self._vision_ready = True
 
     # -------------------- PROCESS FRAME --------------------
     def process_frame(self, frame: np.ndarray, *, draw_camera_hint: bool = True) -> None:
         self.ensure_vision_resources()
 
-        # 🔥 RUN EVERY N FRAMES
-        self._frame_counter = (self._frame_counter + 1) % self.cfg.process_every_n_frames
-
-        if self._frame_counter == 0:
+        # 🔥 RUN ONLY EVERY OTHER FRAME (like face model)
+        if self._process_this_frame:
             self._current_detections = []
 
-            small_frame = cv2.resize(frame, (320, 240))
-            small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            # 🔥 VERY IMPORTANT: reduce size
+            small_frame = cv2.resize(frame, (256, 192))
 
-            results = self._yolo(small_frame, verbose=False)
+            # 🔥 YOLO inference (FAST SETTINGS)
+            results = self._yolo(
+                small_frame,
+                imgsz=256,
+                conf=self.cfg.conf_threshold,
+                verbose=False,
+                device="cpu"
+            )
 
             weapon_found = False
             max_conf = 0.0
@@ -77,8 +82,9 @@ class WeaponDetectionModel:
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                    scale_x = frame.shape[1] / 320
-                    scale_y = frame.shape[0] / 240
+                    # 🔥 SCALE BACK
+                    scale_x = frame.shape[1] / 256
+                    scale_y = frame.shape[0] / 192
 
                     x1 = int(x1 * scale_x)
                     x2 = int(x2 * scale_x)
@@ -87,7 +93,7 @@ class WeaponDetectionModel:
 
                     self._current_detections.append((x1, y1, x2, y2, label, conf))
 
-            # -------- ALERT --------
+            # -------- ALERT LOGIC --------
             if weapon_found:
                 self._weapon_frame_count += 1
             else:
@@ -117,7 +123,10 @@ class WeaponDetectionModel:
 
                 self._weapon_frame_count = 0
 
-        # -------------------- DRAW (ALWAYS) --------------------
+        # 🔁 TOGGLE FRAME (same as face model)
+        self._process_this_frame = not self._process_this_frame
+
+        # -------------------- DRAW ALWAYS --------------------
         for (x1, y1, x2, y2, label, conf) in self._current_detections:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(
@@ -125,7 +134,7 @@ class WeaponDetectionModel:
                 f"{label} {conf:.2f}",
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.5,
                 (0, 0, 255),
                 2,
             )
@@ -136,7 +145,7 @@ class WeaponDetectionModel:
         if draw_camera_hint:
             cv2.putText(
                 frame,
-                f"Cam: (q=quit) | Skip: {self.cfg.process_every_n_frames}",
+                "Cam: (q=quit)",
                 (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -150,13 +159,13 @@ class WeaponDetectionModel:
             max_index=self.cfg.max_camera_index
         ) or [self.cfg.camera_index]
 
-        current_camera_index = camera_cycle[0]
-        cap = open_camera(current_camera_index)
+        cap = open_camera(camera_cycle[0])
 
+        # 🔥 LOW RES CAMERA (BIG BOOST)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
-        print("Starting weapon detection (Frame Skipping Enabled)...")
+        print("🚀 Ultra Fast Weapon Detection Started")
 
         while True:
             ret, frame = cap.read()
