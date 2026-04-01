@@ -11,4 +11,5 @@ class WeaponDetectionConfig:
     conf_threshold: float = float(os.getenv("WEAPON_CONF_THRESHOLD", "0.5"))
     alert_cooldown_s: float = float(os.getenv("WEAPON_ALERT_COOLDOWN", "2.0"))
     frame_threshold: int = int(os.getenv("WEAPON_FRAME_THRESHOLD", "5"))
+    max_camera_index: int = int(os.getenv("MAX_CAMERA_INDEX", "5"))
     router_url: str = os.getenv("SPEECH_ROUTER_URL", "http://127.0.0.1:8000")
