@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class WeaponDetectionConfig:
-    model_path: str = os.getenv("WEAPON_MODEL_PATH", "../assets/weapon_detection/best.pt")
+    model_path: str = os.getenv("WEAPON_MODEL_PATH", "./assets/weapon_detection/best.pt")
     camera_index: int = int(os.getenv("WEAPON_CAMERA_INDEX", os.getenv("CAMERA_INDEX", "0")))
     conf_threshold: float = float(os.getenv("WEAPON_CONF_THRESHOLD", "0.5"))
     alert_cooldown_s: float = float(os.getenv("WEAPON_ALERT_COOLDOWN", "2.0"))
