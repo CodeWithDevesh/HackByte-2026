@@ -1,3 +1,23 @@
+# Core API + schema
+fastapi
+uvicorn
+pydantic
+requests
+
+# Computer vision + model runtimes
+opencv-python
+numpy
+ultralytics
+torch
+torchvision
+
+# Face recognition stack
+deepface
+tensorflow
+
+# TTS stack
+pygame
+piper-tts
 absl-py==2.4.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
