@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,63 +19,80 @@ from src.speech.client import SpeechClient
 class WeaponDetectionModel:
     cfg: WeaponDetectionConfig
     speech: SpeechClient
-    window_name: str = "Weapon Detection"
+    window_name: str = "Weapon Detection (Pi Optimized)"
 
-    _yolo: Any = field(default=None, repr=False)
     _vision_ready: bool = field(default=False, repr=False)
+    _yolo: Any = field(default=None, repr=False)
 
-    _process_this_frame: bool = field(default=True, repr=False)
+    _frame_counter: int = field(default=0, repr=False)   # ✅ NEW
+
     _current_detections: list = field(default_factory=list, repr=False)
 
-    _last_alert_time: float = field(default=0.0, repr=False)
     _weapon_frame_count: int = field(default=0, repr=False)
+    _last_alert_time: float = field(default=0.0, repr=False)
     _last_label: str = field(default="weapon", repr=False)
 
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _detect_thread: threading.Thread | None = field(default=None, repr=False)
-
     # -------------------- LOAD MODEL --------------------
-    def ensure_yolo(self) -> None:
+    def ensure_vision_resources(self) -> None:
         if self._vision_ready:
             return
-        self._yolo = YOLO(self.cfg.model_path)
+
+        model_path = self.cfg.model_path
+        if not model_path or not model_path.endswith(".pt"):
+            model_path = "yolov8n.pt"
+
+        self._yolo = YOLO(model_path)
         self._vision_ready = True
 
-    # -------------------- DETECTION LOGIC --------------------
-    def _detect(self, frame: np.ndarray) -> None:
-        """Runs YOLO detection in background thread."""
-        detections = []
-        weapon_found = False
-        max_conf = 0.0
-        last_label = "weapon"
+    # -------------------- PROCESS FRAME --------------------
+    def process_frame(self, frame: np.ndarray, *, draw_camera_hint: bool = True) -> None:
+        self.ensure_vision_resources()
 
-        results = self._yolo(frame, verbose=False)
+        # 🔥 RUN EVERY N FRAMES
+        self._frame_counter = (self._frame_counter + 1) % self.cfg.process_every_n_frames
 
-        for box in results[0].boxes:
-            cls = int(box.cls[0])
-            label = str(self._yolo.names[cls])
-            conf = float(box.conf[0])
+        if self._frame_counter == 0:
+            self._current_detections = []
 
-            if conf < self.cfg.conf_threshold or not is_weapon(label):
-                continue
+            small_frame = cv2.resize(frame, (320, 240))
+            small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-            weapon_found = True
-            max_conf = max(max_conf, conf)
-            last_label = label
+            results = self._yolo(small_frame, verbose=False)
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            detections.append((x1, y1, x2, y2, label, conf))
+            weapon_found = False
+            max_conf = 0.0
 
-        with self._lock:
-            self._current_detections = detections
+            if results and results[0].boxes is not None:
+                for box in results[0].boxes:
+                    cls = int(box.cls[0])
+                    label = str(self._yolo.names[cls])
+                    conf = float(box.conf[0])
 
+                    if conf < self.cfg.conf_threshold or not is_weapon(label):
+                        continue
+
+                    weapon_found = True
+                    max_conf = max(max_conf, conf)
+                    self._last_label = label
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                    scale_x = frame.shape[1] / 320
+                    scale_y = frame.shape[0] / 240
+
+                    x1 = int(x1 * scale_x)
+                    x2 = int(x2 * scale_x)
+                    y1 = int(y1 * scale_y)
+                    y2 = int(y2 * scale_y)
+
+                    self._current_detections.append((x1, y1, x2, y2, label, conf))
+
+            # -------- ALERT --------
             if weapon_found:
                 self._weapon_frame_count += 1
-                self._last_label = last_label
             else:
                 self._weapon_frame_count = 0
 
-            # -------- ALERT --------
             if self._weapon_frame_count >= self.cfg.frame_threshold:
                 now = time.time()
 
@@ -94,57 +110,33 @@ class WeaponDetectionModel:
                         },
                     )
 
-                    # ✅ Non-blocking TTS
-                    threading.Thread(
-                        target=self.speech.post_event,
-                        args=(ev,),
-                        daemon=True,
-                    ).start()
+                    if not self.speech.post_event(ev):
+                        print("[Warning] Speech router not reachable.")
 
                     self._last_alert_time = now
 
                 self._weapon_frame_count = 0
 
-    # -------------------- PROCESS FRAME --------------------
-    def process_frame(self, frame: np.ndarray, *, draw_ui_hint: bool = True) -> None:
-        self.ensure_yolo()
-        assert self._yolo is not None
-
-        # -------- CONTROLLED THREADING --------
-        if self._process_this_frame:
-            if self._detect_thread is None or not self._detect_thread.is_alive():
-                frame_copy = frame.copy()  # ✅ Prevent race condition
-                self._detect_thread = threading.Thread(
-                    target=self._detect,
-                    args=(frame_copy,),
-                    daemon=True,
-                )
-                self._detect_thread.start()
-
-        self._process_this_frame = not self._process_this_frame
-
-        # -------- DRAW --------
-        with self._lock:
-            for (x1, y1, x2, y2, label, conf) in self._current_detections:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(
-                    frame,
-                    f"{label} {conf:.2f}",
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
-                )
-
-            if self._weapon_frame_count > 0:
-                draw_alert(frame)
-
-        # -------- UI --------
-        if draw_ui_hint:
+        # -------------------- DRAW (ALWAYS) --------------------
+        for (x1, y1, x2, y2, label, conf) in self._current_detections:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(
                 frame,
-                "Cam: (c=switch, q=quit)",
+                f"{label} {conf:.2f}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+            )
+
+        if self._weapon_frame_count > 0:
+            draw_alert(frame)
+
+        if draw_camera_hint:
+            cv2.putText(
+                frame,
+                f"Cam: (q=quit) | Skip: {self.cfg.process_every_n_frames}",
                 (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -152,71 +144,36 @@ class WeaponDetectionModel:
                 2,
             )
 
-    # -------------------- RUN LOOP --------------------
+    # -------------------- RUN --------------------
     def run(self, list_cameras: bool = False) -> None:
-
-        if list_cameras:
-            cams = probe_cameras(max_index=self.cfg.max_camera_index)
-            print("Available cameras:", cams)
-            return
-
         camera_cycle = probe_cameras(
             max_index=self.cfg.max_camera_index
         ) or [self.cfg.camera_index]
 
-        if self.cfg.camera_index in camera_cycle:
-            cam_pos = camera_cycle.index(self.cfg.camera_index)
-        else:
-            camera_cycle = [self.cfg.camera_index] + camera_cycle
-            cam_pos = 0
-
-        current_camera_index = camera_cycle[cam_pos]
+        current_camera_index = camera_cycle[0]
         cap = open_camera(current_camera_index)
 
-        print("Starting weapon detection stream...")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+        print("Starting weapon detection (Frame Skipping Enabled)...")
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("[Error] Camera frame not received")
                 break
 
-            self.process_frame(frame)
-
-            cv2.putText(
-                frame,
-                f"Cam: {current_camera_index} (c=switch, q=quit)",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
+            self.process_frame(frame, draw_camera_hint=False)
 
             cv2.imshow(self.window_name, frame)
 
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
-            if key == ord("c") and len(camera_cycle) > 1:
-                cam_pos = (cam_pos + 1) % len(camera_cycle)
-                next_index = camera_cycle[cam_pos]
-
-                try:
-                    cap.release()
-                    cap = open_camera(next_index)
-                    current_camera_index = next_index
-                    print(f"Switched to camera {current_camera_index}")
-                except Exception as e:
-                    print(f"[Warning] Camera switch failed: {e}")
 
         cap.release()
         cv2.destroyAllWindows()
 
 
-# -------------------- BUILDER --------------------
 def build_default_weapon_model() -> WeaponDetectionModel:
     cfg = WeaponDetectionConfig()
     speech = SpeechClient(base_url=cfg.router_url, timeout_s=0.2)
