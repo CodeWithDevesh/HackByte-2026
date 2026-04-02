@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 
@@ -8,11 +9,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.models.weapon_detection.model import build_default_weapon_model
 
-
 def main() -> None:
-    model = build_default_weapon_model()
-    model.run()
+    p = argparse.ArgumentParser(description="Weapon detection model runner")
+    p.add_argument("--list-cameras", action="store_true", help="List available cameras and exit.")
+    args = p.parse_args()
 
+    model = build_default_weapon_model()
+    model.run(list_cameras=args.list_cameras)
 
 if __name__ == "__main__":
     main()
