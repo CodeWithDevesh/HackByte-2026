@@ -64,8 +64,9 @@ class WeaponDetectionModel:
                 for box in boxes:
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
                     conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-                    name = self._model.names[cls]
+                    
+                    # Ignore the specific class name and generalize to "weapon"
+                    name = "weapon" 
                     
                     x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
                     new_weapon_data.append(((x, y, w, h), name, conf))
@@ -93,8 +94,7 @@ class WeaponDetectionModel:
                 tracker.has_announced_entrance = True
                 tracker.last_announced_state = "entered"
                 
-                name_split = tracker_id.split('_')[0]
-                alert_message = f"Warning. {name_split.replace('_', ' ')} detected."
+                alert_message = "Warning. Weapon detected."
                 
                 # Create the event object
                 ev = ModelEvent(
@@ -102,7 +102,7 @@ class WeaponDetectionModel:
                     type="weapon_spotted",
                     message=alert_message,
                     priority=EventPriority.HIGH,  
-                    dedupe_key=f"weapon:{name_split}",
+                    dedupe_key="weapon_alert",
                     cooldown_s=15.0, 
                 )
                 
@@ -162,7 +162,9 @@ class WeaponDetectionModel:
 
         for (x, y, w, h), tracker_id, conf in display_data:
             left, top, right, bottom = x, y, x + w, y + h
-            name_label = tracker_id.split('_')[0]
+            
+            # Hardcode the display label to "Weapon"
+            name_label = "Weapon"
             
             cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
             cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
