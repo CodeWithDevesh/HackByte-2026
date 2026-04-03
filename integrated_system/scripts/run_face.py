@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from integrated_system.scripts.run_nav import NavServerNode
 from src.hardware.camera import CameraNode
 from src.models.face_recognition.model import build_default_face_node
 from src.models.weapon_detection.model import build_default_weapon_node
