@@ -2,13 +2,17 @@ import time
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+DIRECTION_API = os.getenv("DIRECTION_API")
 
 # Ensure project root is on sys.path so `import src...` works.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from integrated_system.scripts.run_nav import NavServerNode
+# from integrated_system.scripts.run_nav import NavServerNode
+from src.services.nav.nav import NavServerNode
 from src.hardware.camera import CameraNode
 from src.models.face_recognition.model import build_default_face_node
 from src.models.weapon_detection.model import build_default_weapon_node
@@ -26,6 +30,11 @@ def main():
 
         print("[*] Initializing Weapon Detection...")
         weapon_node = build_default_weapon_node()
+
+        print("[*] Starting Navigation API Server on port 7000...")
+        nav_node = NavServerNode(api_key=DIRECTION_API)
+        nav_node.start();
+        
 
         # Wire up the Central Aggregator!
         print("[*] Initializing Central Aggregator...")
