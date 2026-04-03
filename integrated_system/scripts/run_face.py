@@ -1,5 +1,6 @@
 import time
 import sys
+import os
 from pathlib import Path
 
 # Ensure project root is on sys.path so `import src...` works.
@@ -53,7 +54,7 @@ def main():
         print(f"\n[!] Fatal Error in main loop: {e}")
     finally:
         print("[-] Pipeline terminated.")
-        sys.exit(0)
+        os._exit(0)
 
 if __name__ == "__main__":
     main()

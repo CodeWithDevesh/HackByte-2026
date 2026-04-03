@@ -14,7 +14,13 @@ import face_recognition
 from ultralytics import YOLO
 
 # Project-specific imports
-from src.core.events import EventPriority, ModelEvent, RawFrameEvent, ModelResultEvent, RenderedFrameEvent
+from src.core.events import (
+    EventPriority,
+    ModelEvent,
+    RawFrameEvent,
+    ModelResultEvent,
+    RenderedFrameEvent,
+)
 from src.core.event_bus import shared_event_bus
 from src.models.face_recognition.config import FaceRecognitionConfig
 from src.speech.client import SpeechClient
@@ -23,6 +29,7 @@ from src.speech.client import SpeechClient
 @dataclass
 class PersonTracker:
     """Tracks a unique body ID provided by YOLO."""
+
     yolo_id: int
     name: str = "Scanning..."
     history: deque = field(default_factory=lambda: deque(maxlen=20))
@@ -34,25 +41,26 @@ class PersonTracker:
 
 class FaceModelNode:
     """
-    Subscribes to raw frames via the shared bus, runs YOLO + Face Recognition, 
+    Subscribes to raw frames via the shared bus, runs YOLO + Face Recognition,
     calculates intent, triggers voice events, and publishes drawing coordinates.
     """
+
     def __init__(self, cfg: FaceRecognitionConfig, speech: SpeechClient):
         self.cfg = cfg
         self.speech = speech
-        
+
         print("[Vision] Loading YOLOv8 Nano...")
         self._yolo_model = YOLO("yolov8n.pt")
         self._known_face_encodings: list = []
         self._known_face_names: list = []
-        
+
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._is_recognizing = False
         self._trackers: dict[int, PersonTracker] = {}
-        
+
         # Load known faces on boot
         self._load_known_faces()
-        
+
         # Subscribe to internal vision bus and external voice bus
         shared_event_bus.subscribe("raw_frame", self.on_raw_frame)
         shared_event_bus.subscribe("voice_command", self._on_voice_command)
@@ -86,7 +94,11 @@ class FaceModelNode:
     def describe_scene(self) -> str:
         active_people = []
         for tracker in self._trackers.values():
-            if tracker.is_active and tracker.has_announced_entrance and tracker.name != "Scanning...":
+            if (
+                tracker.is_active
+                and tracker.has_announced_entrance
+                and tracker.name != "Scanning..."
+            ):
                 state = tracker.last_announced_state.replace("_", " ")
 
                 if state in ["stationary", "entered", "none"]:
@@ -100,7 +112,11 @@ class FaceModelNode:
                 else:
                     action = state
 
-                display_name = "someone I don't recognize" if tracker.name == "Unknown person" else tracker.name
+                display_name = (
+                    "someone I don't recognize"
+                    if tracker.name == "Unknown person"
+                    else tracker.name
+                )
                 active_people.append(f"{display_name} {action}")
 
         if not active_people:
@@ -121,7 +137,9 @@ class FaceModelNode:
             try:
                 encodings = face_recognition.face_encodings(face_crop_rgb)
                 if encodings and len(self._known_face_encodings) > 0:
-                    face_distances = face_recognition.face_distance(self._known_face_encodings, encodings[0])
+                    face_distances = face_recognition.face_distance(
+                        self._known_face_encodings, encodings[0]
+                    )
                     best_idx = np.argmin(face_distances)
 
                     if face_distances[best_idx] < 0.6:
@@ -135,8 +153,10 @@ class FaceModelNode:
 
     def _get_spatial_description(self, cx: float, frame_width: int) -> str:
         third = frame_width / 3
-        if cx < third: return "on your left"
-        elif cx > 2 * third: return "on your right"
+        if cx < third:
+            return "on your left"
+        elif cx > 2 * third:
+            return "on your right"
         return "in front of you"
 
     def _analyze_and_announce_intent(self, frame_width: int):
@@ -146,7 +166,9 @@ class FaceModelNode:
 
             # 1. EXPIRATION
             if not tracker.is_active:
-                if len(tracker.history) > 0 and (current_time - tracker.history[-1][0] > 10.0):
+                if len(tracker.history) > 0 and (
+                    current_time - tracker.history[-1][0] > 10.0
+                ):
                     del self._trackers[yolo_id]
                 continue
 
@@ -185,9 +207,12 @@ class FaceModelNode:
             threshold = max(80, oldest_h * 0.20)
 
             current_state = "stationary"
-            if newest_h > 400: current_state = "very_close"
-            elif height_diff > threshold: current_state = "approaching"
-            elif height_diff < -threshold: current_state = "leaving"
+            if newest_h > 400:
+                current_state = "very_close"
+            elif height_diff > threshold:
+                current_state = "approaching"
+            elif height_diff < -threshold:
+                current_state = "leaving"
 
             # 5. ANNOUNCEMENTS
             time_since_last_event = current_time - tracker.last_event_time
@@ -197,8 +222,10 @@ class FaceModelNode:
                 message = ""
                 priority = EventPriority.NORMAL
 
-                if current_state == "approaching": message = f"{name} is approaching."
-                elif current_state == "leaving": message = f"{name} is walking away."
+                if current_state == "approaching":
+                    message = f"{name} is approaching."
+                elif current_state == "leaving":
+                    message = f"{name} is walking away."
                 elif current_state == "very_close":
                     message = f"{name} is right in front of you."
                     priority = EventPriority.HIGH
@@ -223,13 +250,15 @@ class FaceModelNode:
         current_time = time.time()
 
         # 1. RUN YOLO
-        results = self._yolo_model.track(frame, classes=[0], persist=True, verbose=False)
+        results = self._yolo_model.track(
+            frame, classes=[0], persist=True, verbose=False
+        )
 
         for tracker in self._trackers.values():
             tracker.is_active = False
 
         pending_identifications = []
-        drawing_data = [] # Data sent to Aggregator
+        drawing_data = []  # Data sent to Aggregator
 
         # 2. PROCESS TRACKS
         if results[0].boxes.id is not None:
@@ -249,11 +278,17 @@ class FaceModelNode:
                 tracker.history.append((current_time, h, cx))
 
                 # Bundle visual data to send to the drawing node
-                tracker_state = tracker.last_announced_state if tracker.has_announced_entrance else ""
-                drawing_data.append({
-                    "box": (x1, y1, x2, y2),
-                    "label": f"{tracker.name} ({tracker_state})"
-                })
+                tracker_state = (
+                    tracker.last_announced_state
+                    if tracker.has_announced_entrance
+                    else ""
+                )
+                drawing_data.append(
+                    {
+                        "box": (x1, y1, x2, y2),
+                        "label": f"{tracker.name} ({tracker_state})",
+                    }
+                )
 
                 if tracker.name == "Scanning...":
                     pad = 20
@@ -277,73 +312,103 @@ class FaceModelNode:
         # 4. PUBLISH RESULTS FOR DRAWING
         # CRITICAL: run_async=False prevents thread exhaustion for video frames!
         shared_event_bus.publish(
-            "model_result", 
+            "model_result",
             ModelResultEvent(event.frame_id, "FaceModel", drawing_data),
-            run_async=False 
+            run_async=False,
         )
 
 
 class AggregatorNode:
     """
-    Subscribes to raw frames and model data, draws the bounding boxes, 
+    Subscribes to raw frames and model data, draws the bounding boxes,
     and publishes the final composed image for the network streamer.
     """
+
     def __init__(self):
         self.frame_buffer = {}
         self.lock = threading.Lock()
-        
+
         shared_event_bus.subscribe("raw_frame", self.on_raw_frame)
         shared_event_bus.subscribe("model_result", self.on_model_result)
 
     def on_raw_frame(self, event: RawFrameEvent):
         with self.lock:
-            self.frame_buffer[event.frame_id] = {
-                "frame": event.frame.copy(),
-                "timestamp": time.time(),
-                "model_data": []
-            }
+            # If we haven't seen this frame ID yet, initialize it
+            if event.frame_id not in self.frame_buffer:
+                self.frame_buffer[event.frame_id] = {
+                    "frame": None,
+                    "timestamp": time.time(),
+                    "model_data": None,
+                }
+
+            # Store the frame
+            self.frame_buffer[event.frame_id]["frame"] = event.frame.copy()
+            self._check_and_render(event.frame_id)
 
     def on_model_result(self, event: ModelResultEvent):
         with self.lock:
+            # If YOLO finished before the frame arrived here, initialize it
             if event.frame_id not in self.frame_buffer:
-                return 
-            
-            self.frame_buffer[event.frame_id]["model_data"] = event.data
-            self._render_and_publish(event.frame_id)
+                self.frame_buffer[event.frame_id] = {
+                    "frame": None,
+                    "timestamp": time.time(),
+                    "model_data": None,
+                }
 
-    def _render_and_publish(self, frame_id: int):
-        data = self.frame_buffer.pop(frame_id)
-        frame = data["frame"]
-        
-        # Draw bounding boxes and labels based on model results
-        for person in data["model_data"]:
+            # Store the YOLO math
+            self.frame_buffer[event.frame_id]["model_data"] = event.data
+            self._check_and_render(event.frame_id)
+
+    def _check_and_render(self, frame_id: int):
+        # Only render if we have BOTH the image AND the math
+        data = self.frame_buffer[frame_id]
+        if data["frame"] is None or data["model_data"] is None:
+            return
+
+        # We have both! Extract them and remove from buffer
+        ready_data = self.frame_buffer.pop(frame_id)
+        frame = ready_data["frame"]
+        model_data = ready_data["model_data"]
+
+        # Draw bounding boxes and labels
+        for person in model_data:
             x1, y1, x2, y2 = person["box"]
             label = person["label"]
-            
+
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
             cv2.rectangle(frame, (x1, y2 - 35), (x2, y2), (255, 165, 0), cv2.FILLED)
             cv2.putText(
-                frame, label, (x1 + 6, y2 - 6), 
-                cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1
+                frame,
+                label,
+                (x1 + 6, y2 - 6),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
             )
 
-        # Draw system hints
         cv2.putText(
-            frame, "System Active (Aggregated Feed)", (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
+            frame,
+            "System Active (Aggregated Feed)",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
         )
 
         # Broadcast the finalized image
-        # CRITICAL: run_async=False prevents thread exhaustion for video frames!
         shared_event_bus.publish(
-            "rendered_frame", 
-            RenderedFrameEvent(frame_id, frame),
-            run_async=False
+            "rendered_frame", RenderedFrameEvent(frame_id, frame), run_async=False
         )
-        
-        # Memory cleanup: Prevent memory leaks if processing lags
+
+        # Memory cleanup
         current_time = time.time()
-        stale = [fid for fid, fd in self.frame_buffer.items() if current_time - fd["timestamp"] > 1.0]
+        stale = [
+            fid
+            for fid, fd in self.frame_buffer.items()
+            if current_time - fd["timestamp"] > 1.0
+        ]
         for fid in stale:
             del self.frame_buffer[fid]
 
@@ -352,9 +417,9 @@ class AggregatorNode:
 def build_default_face_pipeline() -> tuple[FaceModelNode, AggregatorNode]:
     cfg = FaceRecognitionConfig()
     speech = SpeechClient(base_url=cfg.tts_router_url)
-    
+
     # Initialize the decoupled nodes
     face_node = FaceModelNode(cfg, speech)
     aggregator_node = AggregatorNode()
-    
+
     return face_node, aggregator_node
