@@ -1,189 +1,178 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from src.core.events import EventPriority, ModelEvent
-from src.models.face_recognition.camera import open_camera, probe_cameras
-from src.models.weapon_detection.config import WeaponDetectionConfig
-from src.models.weapon_detection.utils import draw_alert, is_weapon
+# Imported from your existing project structure
+from src.core.events import EventPriority, ModelEvent, RawFrameEvent, ModelResultEvent
+from src.core.event_bus import shared_event_bus
 from src.speech.client import SpeechClient
-
+from src.models.weapon_detection.config import WeaponDetectionConfig
 
 @dataclass
-class WeaponDetectionModel:
-    cfg: WeaponDetectionConfig
-    speech: SpeechClient
-    window_name: str = "Weapon Detection (Pi Ultra Optimized)"
+class WeaponTracker:
+    """Helper class to track a weapon's movement over time."""
+    history: deque = field(default_factory=lambda: deque(maxlen=20))
+    last_announced_state: str = "none"
+    last_event_time: float = 0.0
+    is_active: bool = True
+    has_announced_entrance: bool = False
+    confidence: float = 0.0
 
-    _vision_ready: bool = field(default=False, repr=False)
-    _yolo: Any = field(default=None, repr=False)
 
-    _process_this_frame: bool = field(default=True, repr=False)   # ✅ like face model
-    _current_detections: list = field(default_factory=list, repr=False)
+class WeaponModelNode:
+    """Subscribes to raw frames, runs background YOLO inference, tracks spatially, and publishes results."""
+    
+    def __init__(self, cfg: WeaponDetectionConfig, speech: SpeechClient):
+        self.cfg = cfg
+        self.speech = speech
+        
+        print(f"[Vision] Loading YOLO model from: {self.cfg.model_path}")
+        self._model = YOLO(self.cfg.model_path)
+        
+        self._current_weapon_data: list = []
+        
+        # Threading and Throttling (3 workers to prevent starvation)
+        self._executor = ThreadPoolExecutor(max_workers=3)
+        self._is_detecting = False
+        self._last_detection_time = 0.0
 
-    _weapon_frame_count: int = field(default=0, repr=False)
-    _last_alert_time: float = field(default=0.0, repr=False)
-    _last_label: str = field(default="weapon", repr=False)
+        # Intelligent Spatial Tracking
+        self._trackers: dict[str, WeaponTracker] = {}
+        self._tracker_id_counter = 0
 
-    # -------------------- LOAD MODEL --------------------
-    def ensure_vision_resources(self) -> None:
-        if self._vision_ready:
-            return
+        # Subscribe to the shared video bus
+        shared_event_bus.subscribe("raw_frame", self.on_raw_frame)
 
-        model_path = self.cfg.model_path or "yolov8n.pt"
-
-        # ✅ LOAD LIGHT MODEL + CPU OPT
-        self._yolo = YOLO(model_path)
-        self._yolo.fuse()   # 🔥 faster inference
-
-        self._vision_ready = True
-
-    # -------------------- PROCESS FRAME --------------------
-    def process_frame(self, frame: np.ndarray, *, draw_camera_hint: bool = True) -> None:
-        self.ensure_vision_resources()
-
-        # 🔥 RUN ONLY EVERY OTHER FRAME (like face model)
-        if self._process_this_frame:
-            self._current_detections = []
-
-            # 🔥 VERY IMPORTANT: reduce size
-            small_frame = cv2.resize(frame, (256, 192))
-
-            # 🔥 YOLO inference (FAST SETTINGS)
-            results = self._yolo(
-                small_frame,
-                imgsz=256,
-                conf=self.cfg.conf_threshold,
-                verbose=False,
-                device="cpu"
+    def _detect_weapons_worker(self, frame_copy: np.ndarray) -> None:
+        """Runs in the background thread. Catches errors so they don't fail silently."""
+        try:
+            new_weapon_data = []
+            results = self._model.predict(
+                frame_copy, 
+                conf=self.cfg.confidence_threshold, 
+                verbose=False
             )
-
-            weapon_found = False
-            max_conf = 0.0
-
-            if results and results[0].boxes is not None:
-                for box in results[0].boxes:
-                    cls = int(box.cls[0])
-                    label = str(self._yolo.names[cls])
+            
+            if len(results) > 0 and results[0].boxes is not None:
+                boxes = results[0].boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
                     conf = float(box.conf[0])
+                    
+                    # Ignore the specific class name and generalize to "weapon"
+                    name = "weapon" 
+                    
+                    x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+                    new_weapon_data.append(((x, y, w, h), name, conf))
 
-                    if conf < self.cfg.conf_threshold or not is_weapon(label):
-                        continue
+            self._current_weapon_data = new_weapon_data
 
-                    weapon_found = True
-                    max_conf = max(max_conf, conf)
-                    self._last_label = label
+        except Exception as e:
+            print(f"\n[AI THREAD CRASHED]: {e}\n")
+            
+        finally:
+            self._is_detecting = False
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+    def _analyze_and_alert(self, frame_width: int):
+        current_time = time.time()
 
-                    # 🔥 SCALE BACK
-                    scale_x = frame.shape[1] / 256
-                    scale_y = frame.shape[0] / 192
+        for tracker_id, tracker in list(self._trackers.items()):
+            # 1. Handle Expiration
+            if not tracker.is_active:
+                if len(tracker.history) > 0 and (current_time - tracker.history[-1][0] > 1.5):
+                    del self._trackers[tracker_id]
+                continue
 
-                    x1 = int(x1 * scale_x)
-                    x2 = int(x2 * scale_x)
-                    y1 = int(y1 * scale_y)
-                    y2 = int(y2 * scale_y)
+            # 2. Handle Entrance & Alerting
+            if not tracker.has_announced_entrance and len(tracker.history) > 3:
+                tracker.has_announced_entrance = True
+                tracker.last_announced_state = "entered"
+                
+                alert_message = "Warning. Weapon detected."
+                
+                # Create the event object
+                ev = ModelEvent(
+                    source="weapon_detection",
+                    type="weapon_spotted",
+                    message=alert_message,
+                    priority=EventPriority.HIGH,  
+                    dedupe_key="weapon_alert",
+                    cooldown_s=15.0, 
+                )
+                
+                # Send the network alert in the background thread to prevent camera freeze
+                self._executor.submit(self.speech.post_event, ev)
+                print(f"[HIGH PRIORITY ALERT] {alert_message}")
+                
+                tracker.last_event_time = current_time
 
-                    self._current_detections.append((x1, y1, x2, y2, label, conf))
+    def on_raw_frame(self, event: RawFrameEvent) -> None:
+        frame = event.frame
+        current_time = time.time()
+        frame_width = frame.shape[1]
 
-            # -------- ALERT LOGIC --------
-            if weapon_found:
-                self._weapon_frame_count += 1
-            else:
-                self._weapon_frame_count = 0
+        for tracker in self._trackers.values():
+            tracker.is_active = False
 
-            if self._weapon_frame_count >= self.cfg.frame_threshold:
-                now = time.time()
+        drawing_data = []
 
-                if (now - self._last_alert_time) > self.cfg.alert_cooldown_s:
-                    ev = ModelEvent(
-                        source="weapon_detection",
-                        type="weapon_alert",
-                        message=f"Warning, {self._last_label} detected",
-                        priority=EventPriority.HIGH,
-                        dedupe_key=f"weapon:{self._last_label}",
-                        cooldown_s=self.cfg.alert_cooldown_s,
-                        metadata={
-                            "label": self._last_label,
-                            "confidence": max_conf,
-                        },
-                    )
+        # 1. SMART SPATIAL TRACKING
+        for (ox, oy, ow, oh), name, conf in self._current_weapon_data:
+            cx, cy = ox + ow / 2, oy + oh / 2
+            best_id = None
+            min_dist = float("inf")
 
-                    if not self.speech.post_event(ev):
-                        print("[Warning] Speech router not reachable.")
+            for tracker_id, tracker in self._trackers.items():
+                if tracker_id.startswith(name) and len(tracker.history) > 0:
+                    _, _, last_cx, last_cy = tracker.history[-1]
+                    spatial_dist = ((cx - last_cx) ** 2 + (cy - last_cy) ** 2) ** 0.5
+                    if spatial_dist < (ow * 1.5) and spatial_dist < min_dist:
+                        min_dist = spatial_dist
+                        best_id = tracker_id
 
-                    self._last_alert_time = now
+            if best_id is None:
+                self._tracker_id_counter += 1
+                best_id = f"{name}_{self._tracker_id_counter}"
+                self._trackers[best_id] = WeaponTracker()
 
-                self._weapon_frame_count = 0
+            self._trackers[best_id].is_active = True
+            self._trackers[best_id].confidence = conf
+            self._trackers[best_id].history.append((current_time, oh, cx, cy))
+            
+            # Package visual data for the Central Aggregator
+            x1, y1 = ox, oy
+            x2, y2 = ox + ow, oy + oh
+            drawing_data.append({
+                "box": (x1, y1, x2, y2),
+                "label": f"Weapon {conf:.2f}",
+                "color": (0, 0, 255) # RED for weapons
+            })
 
-        # 🔁 TOGGLE FRAME (same as face model)
-        self._process_this_frame = not self._process_this_frame
+        # 2. RUN ALERTS
+        self._analyze_and_alert(frame_width)
 
-        # -------------------- DRAW ALWAYS --------------------
-        for (x1, y1, x2, y2, label, conf) in self._current_detections:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(
-                frame,
-                f"{label} {conf:.2f}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 255),
-                2,
-            )
+        # 3. ASYNC INFERENCE THROTTLING
+        if not self._is_detecting and (current_time - self._last_detection_time > 0.1):
+            self._is_detecting = True
+            self._last_detection_time = current_time
+            self._executor.submit(self._detect_weapons_worker, frame.copy())
 
-        if self._weapon_frame_count > 0:
-            draw_alert(frame)
-
-        if draw_camera_hint:
-            cv2.putText(
-                frame,
-                "Cam: (q=quit)",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-
-    # -------------------- RUN --------------------
-    def run(self, list_cameras: bool = False) -> None:
-        camera_cycle = probe_cameras(
-            max_index=self.cfg.max_camera_index
-        ) or [self.cfg.camera_index]
-
-        cap = open_camera(camera_cycle[0])
-
-        # 🔥 LOW RES CAMERA (BIG BOOST)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-        print("🚀 Ultra Fast Weapon Detection Started")
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            self.process_frame(frame, draw_camera_hint=False)
-
-            cv2.imshow(self.window_name, frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-        cap.release()
-        cv2.destroyAllWindows()
+        # 4. PUBLISH RESULTS FOR CENTRAL DRAWING
+        shared_event_bus.publish(
+            "model_result",
+            ModelResultEvent(event.frame_id, "WeaponModel", drawing_data),
+            run_async=False
+        )
 
 
-def build_default_weapon_model() -> WeaponDetectionModel:
+def build_default_weapon_node() -> WeaponModelNode:
     cfg = WeaponDetectionConfig()
-    speech = SpeechClient(base_url=cfg.router_url, timeout_s=0.2)
-    return WeaponDetectionModel(cfg=cfg, speech=speech)
+    speech = SpeechClient(base_url=cfg.tts_router_url)
+    return WeaponModelNode(cfg=cfg, speech=speech)
