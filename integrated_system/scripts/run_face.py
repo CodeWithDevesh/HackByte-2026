@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import your decoupled nodes
+from integrated_system.scripts.run_nav import NavServerNode
 from src.hardware.camera import CameraNode
 from src.models.face_recognition.model import build_default_face_pipeline
 from src.services.cameraFeed.server import NetworkServerNode
@@ -23,6 +24,8 @@ def main():
         # (They automatically subscribe to the shared_event_bus internally)
         print("\n[*] Initializing AI Models and TTS...")
         face_node, aggregator_node = build_default_face_pipeline()
+
+
 
         # 2. Start the Network Server Thread
         # (It automatically subscribes to "rendered_frame" events)
