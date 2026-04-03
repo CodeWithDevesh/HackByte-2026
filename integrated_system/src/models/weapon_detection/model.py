@@ -9,7 +9,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from src.core.events import EventPriority, ModelEvent
-from src.models.face_recognition.camera import open_camera
+from src.models.face_recognition.camera import open_camera, probe_cameras
 from src.models.weapon_detection.config import WeaponDetectionConfig
 from src.models.weapon_detection.utils import draw_alert, is_weapon
 from src.speech.client import SpeechClient
@@ -19,75 +19,133 @@ from src.speech.client import SpeechClient
 class WeaponDetectionModel:
     cfg: WeaponDetectionConfig
     speech: SpeechClient
-    window_name: str = "Weapon Detection"
+    window_name: str = "Weapon Detection (Pi Ultra Optimized)"
 
+    _vision_ready: bool = field(default=False, repr=False)
     _yolo: Any = field(default=None, repr=False)
-    _last_alert_time: float = field(default=0.0, repr=False)
+
+    _process_this_frame: bool = field(default=True, repr=False)   # ✅ like face model
+    _current_detections: list = field(default_factory=list, repr=False)
+
     _weapon_frame_count: int = field(default=0, repr=False)
+    _last_alert_time: float = field(default=0.0, repr=False)
     _last_label: str = field(default="weapon", repr=False)
 
-    def ensure_yolo(self) -> None:
-        if self._yolo is None:
-            self._yolo = YOLO(self.cfg.model_path)
+    # -------------------- LOAD MODEL --------------------
+    def ensure_vision_resources(self) -> None:
+        if self._vision_ready:
+            return
 
-    def process_frame(self, frame: np.ndarray, *, draw_ui_hint: bool = True) -> None:
-        """Run weapon YOLO on one frame; draw overlays in place."""
-        self.ensure_yolo()
-        assert self._yolo is not None
+        model_path = self.cfg.model_path or "yolov8n.pt"
 
-        results = self._yolo(frame, verbose=False)
-        weapon_found = False
-        max_conf = 0.0
+        # ✅ LOAD LIGHT MODEL + CPU OPT
+        self._yolo = YOLO(model_path)
+        self._yolo.fuse()   # 🔥 faster inference
 
-        for box in results[0].boxes:
-            cls = int(box.cls[0])
-            label = str(self._yolo.names[cls])
-            conf = float(box.conf[0])
-            if conf < self.cfg.conf_threshold or not is_weapon(label):
-                continue
+        self._vision_ready = True
 
-            weapon_found = True
-            max_conf = max(max_conf, conf)
-            self._last_label = label
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+    # -------------------- PROCESS FRAME --------------------
+    def process_frame(self, frame: np.ndarray, *, draw_camera_hint: bool = True) -> None:
+        self.ensure_vision_resources()
+
+        # 🔥 RUN ONLY EVERY OTHER FRAME (like face model)
+        if self._process_this_frame:
+            self._current_detections = []
+
+            # 🔥 VERY IMPORTANT: reduce size
+            small_frame = cv2.resize(frame, (256, 192))
+
+            # 🔥 YOLO inference (FAST SETTINGS)
+            results = self._yolo(
+                small_frame,
+                imgsz=256,
+                conf=self.cfg.conf_threshold,
+                verbose=False,
+                device="cpu"
+            )
+
+            weapon_found = False
+            max_conf = 0.0
+
+            if results and results[0].boxes is not None:
+                for box in results[0].boxes:
+                    cls = int(box.cls[0])
+                    label = str(self._yolo.names[cls])
+                    conf = float(box.conf[0])
+
+                    if conf < self.cfg.conf_threshold or not is_weapon(label):
+                        continue
+
+                    weapon_found = True
+                    max_conf = max(max_conf, conf)
+                    self._last_label = label
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                    # 🔥 SCALE BACK
+                    scale_x = frame.shape[1] / 256
+                    scale_y = frame.shape[0] / 192
+
+                    x1 = int(x1 * scale_x)
+                    x2 = int(x2 * scale_x)
+                    y1 = int(y1 * scale_y)
+                    y2 = int(y2 * scale_y)
+
+                    self._current_detections.append((x1, y1, x2, y2, label, conf))
+
+            # -------- ALERT LOGIC --------
+            if weapon_found:
+                self._weapon_frame_count += 1
+            else:
+                self._weapon_frame_count = 0
+
+            if self._weapon_frame_count >= self.cfg.frame_threshold:
+                now = time.time()
+
+                if (now - self._last_alert_time) > self.cfg.alert_cooldown_s:
+                    ev = ModelEvent(
+                        source="weapon_detection",
+                        type="weapon_alert",
+                        message=f"Warning, {self._last_label} detected",
+                        priority=EventPriority.HIGH,
+                        dedupe_key=f"weapon:{self._last_label}",
+                        cooldown_s=self.cfg.alert_cooldown_s,
+                        metadata={
+                            "label": self._last_label,
+                            "confidence": max_conf,
+                        },
+                    )
+
+                    if not self.speech.post_event(ev):
+                        print("[Warning] Speech router not reachable.")
+
+                    self._last_alert_time = now
+
+                self._weapon_frame_count = 0
+
+        # 🔁 TOGGLE FRAME (same as face model)
+        self._process_this_frame = not self._process_this_frame
+
+        # -------------------- DRAW ALWAYS --------------------
+        for (x1, y1, x2, y2, label, conf) in self._current_detections:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(
                 frame,
                 f"{label} {conf:.2f}",
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.5,
                 (0, 0, 255),
                 2,
             )
 
-        if weapon_found:
-            self._weapon_frame_count += 1
-        else:
-            self._weapon_frame_count = 0
-
-        if self._weapon_frame_count >= self.cfg.frame_threshold:
+        if self._weapon_frame_count > 0:
             draw_alert(frame)
-            now = time.time()
-            if (now - self._last_alert_time) > self.cfg.alert_cooldown_s:
-                ev = ModelEvent(
-                    source="weapon_detection",
-                    type="weapon_alert",
-                    message="Warning, weapon detected.",
-                    priority=EventPriority.HIGH,
-                    dedupe_key=f"weapon:{self._last_label}",
-                    cooldown_s=self.cfg.alert_cooldown_s,
-                    metadata={"label": self._last_label, "confidence": max_conf},
-                )
-                if not self.speech.post_event(ev):
-                    print("[Warning] Speech router not reachable.")
-                self._last_alert_time = now
-            self._weapon_frame_count = 0
 
-        if draw_ui_hint:
+        if draw_camera_hint:
             cv2.putText(
                 frame,
-                "q=quit",
+                "Cam: (q=quit)",
                 (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -95,16 +153,27 @@ class WeaponDetectionModel:
                 2,
             )
 
-    def run(self) -> None:
-        self.ensure_yolo()
-        cap = open_camera(self.cfg.camera_index)
+    # -------------------- RUN --------------------
+    def run(self, list_cameras: bool = False) -> None:
+        camera_cycle = probe_cameras(
+            max_index=self.cfg.max_camera_index
+        ) or [self.cfg.camera_index]
+
+        cap = open_camera(camera_cycle[0])
+
+        # 🔥 LOW RES CAMERA (BIG BOOST)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+        print("🚀 Ultra Fast Weapon Detection Started")
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            self.process_frame(frame, draw_ui_hint=True)
+            self.process_frame(frame, draw_camera_hint=False)
+
             cv2.imshow(self.window_name, frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
