@@ -4,6 +4,8 @@ from enum import IntEnum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+import numpy as np
+from dataclasses import dataclass
 
 
 class EventPriority(IntEnum):
@@ -27,7 +29,9 @@ class ModelEvent(BaseModel):
     cooldown_s: float = Field(default=2.0, ge=0.0)
 
     voice_id: Optional[str] = Field(default=None, description="Voice/model id hint")
-    language: Optional[str] = Field(default=None, description="Language hint, e.g. en/hi")
+    language: Optional[str] = Field(
+        default=None, description="Language hint, e.g. en/hi"
+    )
 
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -46,3 +50,21 @@ class EventIngestResponse(BaseModel):
     queued: bool = False
     spoken_immediately: bool = False
 
+
+@dataclass
+class RawFrameEvent:
+    frame_id: int
+    frame: np.ndarray
+
+
+@dataclass
+class ModelResultEvent:
+    frame_id: int
+    model_name: str
+    data: list
+
+
+@dataclass
+class RenderedFrameEvent:
+    frame_id: int
+    frame: np.ndarray
