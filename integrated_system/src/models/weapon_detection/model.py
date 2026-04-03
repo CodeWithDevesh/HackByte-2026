@@ -1,67 +1,45 @@
-from __future__ import annotations
-
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
-import numpy as np
 from ultralytics import YOLO
 
-from src.core.events import EventPriority, ModelEvent
-from src.models.face_recognition.camera import open_camera, probe_cameras
+from src.core.events import EventPriority, ModelEvent, RawFrameEvent, ModelResultEvent
+from src.core.event_bus import shared_event_bus
 from src.models.weapon_detection.config import WeaponDetectionConfig
-from src.models.weapon_detection.utils import draw_alert, is_weapon
+from src.models.weapon_detection.utils import is_weapon
 from src.speech.client import SpeechClient
 
+class WeaponModelNode:
+    """Subscribes to raw frames, runs optimized YOLO weapon detection, and triggers alerts."""
+    
+    def __init__(self, cfg: WeaponDetectionConfig, speech: SpeechClient):
+        self.cfg = cfg
+        self.speech = speech
+        
+        print("[Vision] Loading Weapon Detection (Ultra Optimized)...")
+        self._yolo = YOLO(self.cfg.model_path or "yolov8n.pt")
+        self._yolo.fuse()
 
-@dataclass
-class WeaponDetectionModel:
-    cfg: WeaponDetectionConfig
-    speech: SpeechClient
-    window_name: str = "Weapon Detection (Pi Ultra Optimized)"
+        self._process_this_frame = True
+        self._weapon_frame_count = 0
+        self._last_alert_time = 0.0
+        self._last_label = "weapon"
 
-    _vision_ready: bool = field(default=False, repr=False)
-    _yolo: Any = field(default=None, repr=False)
+        # Subscribe to the shared video bus
+        shared_event_bus.subscribe("raw_frame", self.on_raw_frame)
 
-    _process_this_frame: bool = field(default=True, repr=False)   # ✅ like face model
-    _current_detections: list = field(default_factory=list, repr=False)
+    def on_raw_frame(self, event: RawFrameEvent):
+        frame = event.frame
+        drawing_data = [] # Data to send to the Aggregator
 
-    _weapon_frame_count: int = field(default=0, repr=False)
-    _last_alert_time: float = field(default=0.0, repr=False)
-    _last_label: str = field(default="weapon", repr=False)
-
-    # -------------------- LOAD MODEL --------------------
-    def ensure_vision_resources(self) -> None:
-        if self._vision_ready:
-            return
-
-        model_path = self.cfg.model_path or "yolov8n.pt"
-
-        # ✅ LOAD LIGHT MODEL + CPU OPT
-        self._yolo = YOLO(model_path)
-        self._yolo.fuse()   # 🔥 faster inference
-
-        self._vision_ready = True
-
-    # -------------------- PROCESS FRAME --------------------
-    def process_frame(self, frame: np.ndarray, *, draw_camera_hint: bool = True) -> None:
-        self.ensure_vision_resources()
-
-        # 🔥 RUN ONLY EVERY OTHER FRAME (like face model)
+        # 🔥 RUN ONLY EVERY OTHER FRAME
         if self._process_this_frame:
-            self._current_detections = []
-
-            # 🔥 VERY IMPORTANT: reduce size
             small_frame = cv2.resize(frame, (256, 192))
 
-            # 🔥 YOLO inference (FAST SETTINGS)
+            # YOLO inference (FAST SETTINGS)
             results = self._yolo(
-                small_frame,
-                imgsz=256,
-                conf=self.cfg.conf_threshold,
-                verbose=False,
-                device="cpu"
+                small_frame, imgsz=256, conf=self.cfg.conf_threshold, verbose=False, device="cpu"
             )
 
             weapon_found = False
@@ -82,16 +60,19 @@ class WeaponDetectionModel:
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                    # 🔥 SCALE BACK
+                    # 🔥 SCALE BACK TO ORIGINAL FRAME SIZE
                     scale_x = frame.shape[1] / 256
                     scale_y = frame.shape[0] / 192
 
-                    x1 = int(x1 * scale_x)
-                    x2 = int(x2 * scale_x)
-                    y1 = int(y1 * scale_y)
-                    y2 = int(y2 * scale_y)
+                    x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
+                    y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
 
-                    self._current_detections.append((x1, y1, x2, y2, label, conf))
+                    # Bundle for the Aggregator
+                    drawing_data.append({
+                        "box": (x1, y1, x2, y2),
+                        "label": f"ALERT: {label} {conf:.2f}",
+                        "color": (0, 0, 255)  # RED for weapons
+                    })
 
             # -------- ALERT LOGIC --------
             if weapon_found:
@@ -101,7 +82,6 @@ class WeaponDetectionModel:
 
             if self._weapon_frame_count >= self.cfg.frame_threshold:
                 now = time.time()
-
                 if (now - self._last_alert_time) > self.cfg.alert_cooldown_s:
                     ev = ModelEvent(
                         source="weapon_detection",
@@ -110,80 +90,24 @@ class WeaponDetectionModel:
                         priority=EventPriority.HIGH,
                         dedupe_key=f"weapon:{self._last_label}",
                         cooldown_s=self.cfg.alert_cooldown_s,
-                        metadata={
-                            "label": self._last_label,
-                            "confidence": max_conf,
-                        },
+                        metadata={"label": self._last_label, "confidence": max_conf},
                     )
-
-                    if not self.speech.post_event(ev):
-                        print("[Warning] Speech router not reachable.")
-
+                    self.speech.post_event(ev)
                     self._last_alert_time = now
-
                 self._weapon_frame_count = 0
 
-        # 🔁 TOGGLE FRAME (same as face model)
+        # Toggle for next frame
         self._process_this_frame = not self._process_this_frame
 
-        # -------------------- DRAW ALWAYS --------------------
-        for (x1, y1, x2, y2, label, conf) in self._current_detections:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(
-                frame,
-                f"{label} {conf:.2f}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 255),
-                2,
-            )
-
-        if self._weapon_frame_count > 0:
-            draw_alert(frame)
-
-        if draw_camera_hint:
-            cv2.putText(
-                frame,
-                "Cam: (q=quit)",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-
-    # -------------------- RUN --------------------
-    def run(self, list_cameras: bool = False) -> None:
-        camera_cycle = probe_cameras(
-            max_index=self.cfg.max_camera_index
-        ) or [self.cfg.camera_index]
-
-        cap = open_camera(camera_cycle[0])
-
-        # 🔥 LOW RES CAMERA (BIG BOOST)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-        print("🚀 Ultra Fast Weapon Detection Started")
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            self.process_frame(frame, draw_camera_hint=False)
-
-            cv2.imshow(self.window_name, frame)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-        cap.release()
-        cv2.destroyAllWindows()
+        # Publish results to the Aggregator!
+        shared_event_bus.publish(
+            "model_result",
+            ModelResultEvent(event.frame_id, "WeaponModel", drawing_data),
+            run_async=False
+        )
 
 
-def build_default_weapon_model() -> WeaponDetectionModel:
+def build_default_weapon_node() -> WeaponModelNode:
     cfg = WeaponDetectionConfig()
     speech = SpeechClient(base_url=cfg.router_url, timeout_s=0.2)
-    return WeaponDetectionModel(cfg=cfg, speech=speech)
+    return WeaponModelNode(cfg=cfg, speech=speech)

@@ -1,6 +1,6 @@
 import time
-import sys
 import os
+import sys
 from pathlib import Path
 
 # Ensure project root is on sys.path so `import src...` works.
@@ -8,43 +8,40 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Import your decoupled nodes
 from src.hardware.camera import CameraNode
-from src.models.face_recognition.model import build_default_face_pipeline
+from src.models.face_recognition.model import build_default_face_node
+from src.models.weapon_detection.model import build_default_weapon_node
 from src.services.cameraFeed.server import NetworkServerNode
+from src.core.aggregator import AggregatorNode 
 
 def main():
     print("=============================================")
-    print("  Starting Decoupled AI Vision Pipeline...   ")
+    print("  Starting Multi-Model Vision Pipeline...    ")
     print("=============================================")
 
     try:
-        # 1. Initialize the AI & Drawing Nodes 
-        # (They automatically subscribe to the shared_event_bus internally)
-        print("\n[*] Initializing AI Models and TTS...")
-        face_node, aggregator_node = build_default_face_pipeline()
+        print("\n[*] Initializing Face Recognition...")
+        face_node = build_default_face_node()
 
-        # 2. Start the Network Server Thread
-        # (It automatically subscribes to "rendered_frame" events)
+        print("[*] Initializing Weapon Detection...")
+        weapon_node = build_default_weapon_node()
+
+        # Wire up the Central Aggregator!
+        print("[*] Initializing Central Aggregator...")
+        aggregator = AggregatorNode(expected_models=["FaceModel", "WeaponModel"])
+
         print("[*] Starting TCP Video Server...")
         server = NetworkServerNode(port=9999)
         server.start()
 
-        # 3. Start the Camera Thread
-        # (We start this LAST. If we start it first, it will blast frames 
-        # into the void before YOLO has finished loading into memory!)
         print("[*] Warming up Camera Hardware...")
         camera = CameraNode(camera_index=0)
         camera.start()
 
         print("\n[+] System is fully operational!")
         print("[+] Waiting for client to connect to view feed...")
-        print("    (Press Ctrl+C to shut down gracefully)")
         print("=============================================\n")
 
-        # 4. Keep the main thread alive
-        # The while loop is required because camera and server are running 
-        # on background daemon threads. If main() ends, the script dies.
         while True:
             time.sleep(1)
 
